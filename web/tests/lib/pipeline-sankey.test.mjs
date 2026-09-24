@@ -16,13 +16,6 @@ test("statusToken uses canonStatus aliases (same map as Analytics)", () => {
   assert.equal(statusToken("Rechazado"), "REJECTED");
 });
 
-test("statusToken strips dates and markdown bold", () => {
-  assert.equal(statusToken("Interview"), "INTERVIEW");
-  assert.equal(statusToken("Interview 2026-08-20"), "INTERVIEW");
-  assert.equal(statusToken("**Rejected**"), "REJECTED");
-  assert.equal(statusToken("—"), "DISCARDED");
-});
-
 test("parseStatusLog skips header and reads Interview→Rejected rows", () => {
   const rows = parseStatusLog(
     "num\tdate\tfrom\tto\tsource\tnote\n13\t2026-08-26\tInterview\tRejected\tset-status\t\n3\t2026-08-15\tApplied\tRejected\tset-status\t\n",

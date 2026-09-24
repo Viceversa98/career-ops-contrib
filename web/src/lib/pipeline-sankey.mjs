@@ -63,9 +63,12 @@ export function statusToken(raw) {
     .replace(/\s+\d{4}-\d{2}-\d{2}\s*$/, "")
     .trim();
   const c = canonStatus(base);
-  // Unknown pass-through can still carry junk after the stage word; leaf
-  // equality needs a single token.
-  return c.split(/[\s/]/)[0] || "EVALUATED";
+  // Pass-through uppercases the raw input, so markdown bold that foldStatus
+  // already stripped for alias lookup can survive on English stage names
+  // ("**Rejected**" → "**REJECTED**"). Leaf equality needs a clean token;
+  // Analytics stage bars use .includes() and tolerate the bold.
+  const cleaned = c.replace(/\*\*/g, "").trim();
+  return cleaned.split(/[\s/]/)[0] || "EVALUATED";
 }
 
 /**
