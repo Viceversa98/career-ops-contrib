@@ -66,7 +66,7 @@ export function PipelineSankey({
             const sourceLabel = labelById.get(link.source) ?? link.source;
             const targetLabel = labelById.get(link.target) ?? link.target;
             return (
-              <g key={`${link.source}-${link.target}`} tabIndex={0} aria-label={`${link.value} from ${sourceLabel} to ${targetLabel}`}>
+              <g key={`${link.source}-${link.target}`}>
                 <title>{`${link.value} roles: ${sourceLabel} → ${targetLabel}`}</title>
                 <path d={link.d} className={cn(TONE_LINK[tone] ?? TONE_LINK.neutral, "outline-none")} />
               </g>
@@ -80,7 +80,7 @@ export function PipelineSankey({
             const lx = labelOnRight ? node.x + node.width + 10 : node.x - 10;
             const anchor = labelOnRight ? "start" : "end";
             return (
-              <g key={node.id} tabIndex={0} aria-label={`${node.label}: ${node.value} roles`}>
+              <g key={node.id}>
                 <title>{`${node.label}: ${node.value}`}</title>
                 <rect
                   x={node.x}

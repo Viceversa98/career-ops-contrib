@@ -21,6 +21,7 @@ export const NODE_DEFS = [
   { id: "tracked", label: "Tracked", rank: 0, tone: "neutral" },
   { id: "skip", label: "SKIP", rank: 1, tone: "danger" },
   { id: "evaluated", label: "Still evaluated", rank: 1, tone: "muted" },
+  { id: "discardedEarly", label: "Discarded (not applied)", rank: 1, tone: "muted" },
   { id: "submitted", label: "Submitted", rank: 1, tone: "info" },
   { id: "waiting", label: "Waiting", rank: 2, tone: "warn" },
   { id: "engaged", label: "Company engaged", rank: 2, tone: "info" },
@@ -36,9 +37,16 @@ export const NODE_DEFS = [
 
 const ADVANCED = new Set(["INTERVIEW", "OFFER", "HIRED"]);
 
+// Discarded (withdrawn, or the posting closed) is not by itself a proven
+// submission: the core counts it in neither `submitted` nor `decided`
+// (modes/patterns.md). A Discarded row stays under Submitted only when the
+// status log shows it reached one of these; otherwise it leaves from Tracked.
+const SUBMITTED_OR_LATER = new Set(["APPLIED", "RESPONDED", "INTERVIEW", "OFFER", "HIRED", "REJECTED"]);
+
 const LEAVES = [
   "skip",
   "evaluated",
+  "discardedEarly",
   "waiting",
   "screening",
   "interview",
@@ -108,6 +116,19 @@ function logReachedAdvanced(num, log) {
 }
 
 /**
+ * @param {number} num
+ * @param {SankeyLogRow[]} log
+ * @returns {boolean}
+ */
+function logReachedSubmitted(num, log) {
+  return log.some(
+    (row) =>
+      row.num === num &&
+      (SUBMITTED_OR_LATER.has(statusToken(row.from)) || SUBMITTED_OR_LATER.has(statusToken(row.to))),
+  );
+}
+
+/**
  * Exclusive leaf for one tracker row.
  * @param {SankeyApp} app
  * @param {SankeyLogRow[]} log
@@ -126,7 +147,10 @@ export function classifyLeaf(app, log) {
   if (status === "OFFER") return "offer";
   if (status === "HIRED") return "hired";
   if (status === "REJECTED") return reachedInterview ? "rejectedInterview" : "rejectedApply";
-  if (status === "DISCARDED") return reachedInterview ? "discardedInterview" : "discarded";
+  if (status === "DISCARDED") {
+    if (reachedInterview) return "discardedInterview";
+    return logReachedSubmitted(num, log) ? "discarded" : "discardedEarly";
+  }
   return "evaluated";
 }
 
@@ -156,6 +180,7 @@ export function buildPipelineSankey(apps, log = []) {
     tracked: rows.length,
     skip: counts.skip,
     evaluated: counts.evaluated,
+    discardedEarly: counts.discardedEarly,
     submitted,
     waiting: counts.waiting,
     engaged,
@@ -174,6 +199,7 @@ export function buildPipelineSankey(apps, log = []) {
   const rawLinks = [
     { source: "tracked", target: "skip", value: values.skip },
     { source: "tracked", target: "evaluated", value: values.evaluated },
+    { source: "tracked", target: "discardedEarly", value: values.discardedEarly },
     { source: "tracked", target: "submitted", value: values.submitted },
     { source: "submitted", target: "waiting", value: values.waiting },
     { source: "submitted", target: "engaged", value: values.engaged },

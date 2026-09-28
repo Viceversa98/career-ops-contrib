@@ -157,10 +157,19 @@ export type StatusLogRow = {
   note: string;
 };
 
-/** Append-only tracker transitions from data/status-log.tsv. Empty if missing. */
+/** Append-only tracker transitions from data/status-log.tsv. A missing log is
+ *  normal (no status change recorded yet) and yields []. Any other read failure
+ *  is rethrown: an unreadable log must not pass for an empty one, which would
+ *  silently drop recorded interview paths from the Sankey (web/AGENTS.md: a
+ *  missing file is not a malformed file). */
 export function readStatusLog(): StatusLogRow[] {
-  const tsv = read("data/status-log.tsv");
-  if (!tsv) return [];
+  let tsv: string;
+  try {
+    tsv = fs.readFileSync(path.join(careerOpsRoot(), "data/status-log.tsv"), "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return [];
+    throw err;
+  }
   return parseStatusLog(tsv);
 }
 
