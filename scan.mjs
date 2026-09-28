@@ -69,7 +69,7 @@ import { workdayDedupKey, stripWorkdayRepostSuffix, isWorkdayJobUrl } from './pr
 import { normalizeCompany } from './tracker-utils.mjs';
 import { normalizeCompanyName } from './invite-match.mjs';
 import { withPipelineLock } from './pipeline-lock.mjs';
-import { compileKeyword, compilePositiveKeyword, compileContentKeyword, buildTitleFilter } from './title-keywords.mjs';
+import { compileKeyword, compilePositiveKeyword, compileContentKeyword, buildTitleFilter, foldAccents } from './title-keywords.mjs';
 import { flagValue, hasFlag, validateFlags } from './lib/cli-flags.mjs';
 import { withPortalHealthLock } from './portal-health-lock.mjs';
 import { localToday } from './lib/local-today.mjs';
@@ -265,7 +265,7 @@ function compiledPositiveMatchers(positiveList) {
   if (compiledPositiveCache.has(positiveList)) return compiledPositiveCache.get(positiveList);
   const compiled = positiveList
     .filter(k => typeof k === 'string' && k.trim().length > 0)
-    .map(k => ({ raw: k, match: compilePositiveKeyword(k.trim().toLowerCase()) }));
+    .map(k => ({ raw: k, match: compilePositiveKeyword(foldAccents(k.trim().toLowerCase())) }));
   compiledPositiveCache.set(positiveList, compiled);
   return compiled;
 }
@@ -277,7 +277,7 @@ function compiledPositiveMatchers(positiveList) {
 // `by_title_keyword` key must be written exactly as the positive entry is.
 export function matchedTitleKeywords(title, titleFilter) {
   const raw = Array.isArray(titleFilter?.positive) ? titleFilter.positive : [];
-  const lower = (title || '').toLowerCase();
+  const lower = foldAccents((title || '').toLowerCase());
   return compiledPositiveMatchers(raw)
     .filter(({ match }) => match(lower))
     .map(({ raw: kw }) => kw);
@@ -332,17 +332,25 @@ function normalizeKeywordList(value) {
 // Lookarounds rather than \b so keywords that begin or end with punctuation
 // (", IND", "UK -") still anchor correctly — \b is defined relative to word
 // characters and behaves surprisingly at a punctuation edge.
+// Letters, combining marks and numbers form words in every script; ASCII-only
+// boundaries let "al," match inside "Montréal," (including decomposed accents).
 // Note: distinct from compileKeyword() above, which serves the *title* filter and
 // only boundary-anchors 2-3 letter acronyms. Location keywords need boundaries on
 // every keyword, so they get their own compiler rather than changing title-matching
 // behaviour. Returns a predicate, mirroring compileKeyword()'s shape.
+// Edges are tested one code point at a time against a fully anchored class:
+// V8 in Node 26 returns false for /[\p{L}]$/u against an astral letter at
+// end-of-string (#4478), so "𐐀" lost its trailing boundary and matched "𐐀x".
+const LOCATION_WORD_CP = /^[\p{L}\p{M}\p{N}]$/u;
+
 function compileLocationKeyword(keyword) {
   const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const startsWord = /[a-z0-9]/.test(keyword[0]);
-  const endsWord = /[a-z0-9]/.test(keyword[keyword.length - 1]);
-  const prefix = startsWord ? '(?<![a-z0-9])' : '';
-  const suffix = endsWord ? '(?![a-z0-9])' : '';
-  const re = new RegExp(`${prefix}${escaped}${suffix}`);
+  const codePoints = [...keyword];
+  const startsWord = LOCATION_WORD_CP.test(codePoints[0] ?? '');
+  const endsWord = LOCATION_WORD_CP.test(codePoints.at(-1) ?? '');
+  const prefix = startsWord ? '(?<![\\p{L}\\p{M}\\p{N}])' : '';
+  const suffix = endsWord ? '(?![\\p{L}\\p{M}\\p{N}])' : '';
+  const re = new RegExp(`${prefix}${escaped}${suffix}`, 'u');
   return (lower) => re.test(lower);
 }
 
@@ -411,9 +419,10 @@ const USPS_STATES = Object.freeze([
 // ("Dublin OH", Workday URL hint "dublin oh"). Not a generic word-boundary —
 // English "in"/"or"/"me" in "Remote, Belgium or France" must not impersonate
 // Indiana/Oregon/Maine. State *names* still use compileLocationKeyword.
+// Unicode letters and marks are part of the token: "Montréal" is not "AL".
 function compileUsStateAbbrev(abbr) {
   const escaped = abbr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp(`(?:,\\s*${escaped}(?![a-z0-9])|(?:^|[^a-z0-9])${escaped}[^a-z0-9]*$)`);
+  const re = new RegExp(`(?:,\\s*${escaped}(?![\\p{L}\\p{M}\\p{N}])|(?:^|[^\\p{L}\\p{M}\\p{N}])${escaped}[^\\p{L}\\p{M}\\p{N}]*$)`, 'u');
   return (lower) => re.test(lower);
 }
 
@@ -444,7 +453,8 @@ export function locationHintFromUrl(url) {
   if (!parsed.hostname.toLowerCase().endsWith('.myworkdayjobs.com')) return '';
   const segments = parsed.pathname.split('/').filter(Boolean);
   const jobIdx = segments.lastIndexOf('job');
-  if (jobIdx === -1 || jobIdx === segments.length - 1) return '';
+  // Workday also emits /job/{Title}_{ReqId}; a location needs a title after it.
+  if (jobIdx === -1 || segments.length - jobIdx - 1 < 2) return '';
   let segment = segments[jobIdx + 1];
   try {
     segment = decodeURIComponent(segment);
@@ -987,18 +997,123 @@ export function buildSalaryFilter(salaryFilter) {
   };
 }
 
+// CJK/Korean corporate-form markers (#2570), kept as a list local to this
+// file rather than folded into invite-match.mjs's LEGAL_SUFFIXES. Two reasons
+// they can't share one list: LEGAL_SUFFIXES strips a *trailing, space-
+// delimited* word (`\s${suffix}$`), but 株式会社 is usually written unspaced,
+// as a *prefix* (株式会社メルカリ) and sometimes as a suffix (メルカリ株式会社),
+// so LEGAL_SUFFIXES's anchor fires on neither. (The spaced variant
+// 株式会社 メルカリ is ordinary orthography too, and it already matched before
+// this change — via the punctuation-to-space key and the containment
+// fallback. The unspaced form is the actual gap.) And
+// invite-match.mjs's normalizeCompanyName is deliberately stricter than
+// companyMatch (loosely-quoted email text vs. an identity key that must never
+// merge two different companies) — folding a CJK list into that stricter
+// normalizer risks loosening its callers too, which the "splits, never
+// merges" rule #2445/#2569 protects was written to prevent.
+const CORPORATE_FORMS = [
+  '株式会社', '合同会社', '有限会社',   // Japanese
+  '合名会社', '合資会社', '一般社団法人',
+  '股份有限公司',                       // Chinese (longer forms first)
+  '有限责任公司', '有限責任公司',       // no 有限公司 suffix: 责任 sits between
+  '有限公司',
+  '주식회사', '유한회사',               // Korean
+];
+
+// Split an already normalizeTextKey'd string into [forms, remainder], where
+// `forms` names the corporate-form markers found at its leading and trailing
+// edges, in that order, or null when there are none. Order is kept rather than
+// sorted: 株式会社アカネ有限会社 and 有限会社アカネ株式会社 stay apart, the
+// conservative reading when a name carries two forms.
+// No space anchor: unlike LEGAL_SUFFIXES these forms are frequently written
+// unspaced (株式会社メルカリ), which is exactly the case the \b-based approach
+// cannot reach. The spaced variant (株式会社 メルカリ) already matched before
+// #2570, through the punctuation-to-space key and the containment fallback
+// below; the unspaced one is the gap. Longer forms are checked first
+// (股份有限公司 before 有限公司) so a strip cannot leave a dangling 股份 behind.
+//
+// BOTH edges are inspected, not just the first form list order finds. A name
+// carrying a form at each end (合同会社 アカネ株式会社) is rare, but reading
+// only one of them let the other slip past the different-form check below:
+// the shared 株式会社 was compared, the 合同会社 never was, and containment
+// merged the pair.
+//
+// Returning the forms rather than just the remainder is what lets companyMatch
+// tell "one side omitted the form" from "the two sides carry DIFFERENT forms".
+// A bare remainder cannot express that difference, and collapsing it merges
+// 株式会社アカネ with 合同会社アカネ — a KK and a GK are two different legal
+// entities sharing a trade name, so that is a false merge, the one direction
+// #2445/#2569's "splits, never merges" rule exists to forbid.
+function stripCorporateForm(key) {
+  const forms = [];
+  let rest = key;
+  const prefix = CORPORATE_FORMS.find((form) => rest.startsWith(form));
+  if (prefix) {
+    forms.push(prefix);
+    rest = rest.slice(prefix.length);
+  }
+  const suffix = CORPORATE_FORMS.find((form) => rest.endsWith(form));
+  if (suffix) {
+    forms.push(suffix);
+    rest = rest.slice(0, -suffix.length);
+  }
+  return [forms.length ? forms.join('|') : null, rest];
+}
+
+// Apply the strip to a pair of keys, or return null: a verdict that the pair
+// is NOT the same company, which companyMatch returns before any equality or
+// containment check. Two cases earn it:
+//
+//  - DIFFERENT explicit forms on the two sides are positive evidence of two
+//    different entities, the same way a mismatched req number is (#1524).
+//    Merely declining to strip was not enough: the raw keys still reached the
+//    containment fallback, where 株式会社アカネ is a bounded substring of
+//    合同会社 株式会社アカネ.
+//  - Exactly one side is ONLY a marker ("株式会社" alone). That side carries no
+//    trade name to compare, and falling back to its raw key let it equal
+//    株式会社株式会社 once that was stripped. Two identical bare markers still
+//    compare equal, since both then keep their raw keys.
+//
+// Otherwise strip, falling back to the raw key when the strip empties it, so
+// neither the equality check nor the containment fallback is ever handed an
+// empty "no signal" string.
+function stripFormPair(rawA, rawB) {
+  const [formsA, restA] = stripCorporateForm(rawA);
+  const [formsB, restB] = stripCorporateForm(rawB);
+  if (formsA && formsB && formsA !== formsB) return null;
+  if (Boolean(formsA && !restA) !== Boolean(formsB && !restB)) return null;
+  return [restA || rawA, restB || rawB];
+}
+
 export function companyMatch(jobCompany, windowCompany) {
   // Unicode-aware (#2393 family): the [a-z0-9] strip this used to carry erased
   // non-Latin scripts outright, so 株式会社アカネ and 合同会社ゾロ both cleaned
   // to '' and the equality check below reported two unrelated companies as the
   // same one. The empty guard is part of the fix, not decoration — "no usable
   // signal on either side" must never read as "identical".
-  const c1NoSpaces = normalizeTextKey(jobCompany);
-  const c2NoSpaces = normalizeTextKey(windowCompany);
+  //
+  // Corporate-form stripping (#2570) happens right here, before either the
+  // equality check or the containment fallback below, so both benefit. See
+  // stripFormPair: it returns null when the forms show two different
+  // entities, and that ends the comparison, so this stays a split, never a
+  // merge. The no-space key reaches every such verdict first in practice (an
+  // exhaustive search over prefix/suffix/separator combinations found no
+  // exception); the spaced key's null check is defensive, and keeps a null
+  // from ever being destructured.
+  const noSpaces = stripFormPair(
+    normalizeTextKey(jobCompany),
+    normalizeTextKey(windowCompany),
+  );
+  if (!noSpaces) return false;
+  const [c1NoSpaces, c2NoSpaces] = noSpaces;
   if (c1NoSpaces && c1NoSpaces === c2NoSpaces) return true;
 
-  const c1WithSpaces = normalizeTextKey(jobCompany, ' ');
-  const c2WithSpaces = normalizeTextKey(windowCompany, ' ');
+  const withSpaces = stripFormPair(
+    normalizeTextKey(jobCompany, ' '),
+    normalizeTextKey(windowCompany, ' '),
+  );
+  if (!withSpaces) return false;
+  const [c1WithSpaces, c2WithSpaces] = withSpaces;
   if (!c1WithSpaces || !c2WithSpaces) return false;
 
   // Containment: a short window name should still match a longer official one
@@ -1016,12 +1131,11 @@ export function companyMatch(jobCompany, windowCompany) {
   // कंपनी mid-word — the key and its boundaries have to agree on what a letter
   // is, or they drift the way #2397 and #2445 fixed elsewhere.
   //
-  // Non-Latin containment does not fire here (株式会社メルカリ vs メルカリ): the
-  // lookbehind sees 社, a letter, so there is no boundary to assert, and
-  // Japanese is not space-delimited so no anchor rule recovers it. Note this
-  // pair DID match before this change, but only via the '' === '' collision
-  // that erased both names — not through this path. Making it match on purpose
-  // needs corporate-form normalisation, tracked separately in #2570.
+  // 株式会社メルカリ vs メルカリ never reaches this containment fallback at
+  // all now (#2570): the corporate-form strip above already resolves it via
+  // the equality check, since 社 being a letter still means no anchor rule
+  // here could have matched it directly — Japanese isn't space-delimited, so
+  // no boundary exists for the lookbehind to find.
   //
   // compileLocationKeyword() above reached for lookarounds too, for a related
   // reason ("\b behaves surprisingly at a punctuation edge"); its escape set is
@@ -2647,6 +2761,10 @@ export async function appendToScanHistory(offers, date, status = 'added') {
 // list was silently empty while the run reported no filtering at all.
 const BLACKLIST_PATH = path.join(DATA_ROOT, 'data/blacklist.md');
 
+function normalizeBlacklistDomain(domain) {
+  return String(domain || '').trim().toLowerCase().replace(/\.$/, '');
+}
+
 /**
  * Parse the user's do-not-apply list (data/blacklist.md, user layer, opt-in).
  *
@@ -2657,8 +2775,8 @@ const BLACKLIST_PATH = path.join(DATA_ROOT, 'data/blacklist.md');
  * blacklist row "Acme Corp." still catches an ATS feed that says "acme corp".
  *
  * @param {string} text - Raw data/blacklist.md content.
- * @returns {Map<string, {company: string, since: string, scope: string, reason: string}>}
- *          Normalized company key → entry. First row wins on duplicate keys.
+ * @returns {Map<string, {company: string, since: string, scope: 'company'|'domain', reason: string}>}
+ *          Normalized company key or domain:<hostname> → entry. First row wins on duplicate keys.
  */
 export function parseBlacklist(text) {
   const entries = new Map();
@@ -2668,16 +2786,54 @@ export function parseBlacklist(text) {
     const company = cells[1] || '';
     if (!company || /^[-: ]+$/.test(company)) continue; // separator row
     if (company.toLowerCase() === 'company') continue;  // header row
-    const key = normalizeCompany(company);
-    if (!key || entries.has(key)) continue;
+    const scope = (cells[3] || 'company').toLowerCase();
+    const value = scope === 'domain' ? normalizeBlacklistDomain(company) : normalizeCompany(company);
+    const key = scope === 'domain' ? `domain:${value}` : value;
+    if (!value || entries.has(key)) continue;
     entries.set(key, {
       company,
       since: cells[2] || '',
-      scope: cells[3] || '',
+      // A blank or unsupported scope keeps the long-standing company-name
+      // behavior. Only the documented `domain` value enables host matching.
+      scope: scope === 'domain' ? 'domain' : 'company',
       reason: cells[4] || '',
     });
   }
   return entries;
+}
+
+/**
+ * Find the blacklist entry that applies to one posting.
+ *
+ * `company` is the established default: compare the feed's company label with
+ * the normalized table value. `domain` is opt-in: the table's Company cell is
+ * a hostname suffix, so `ibm.com` matches `jobs.ibm.com` but not `notibm.com`.
+ * This deliberately does not infer parent/subsidiary ownership from a URL.
+ *
+ * @param {Map<string, {company: string, since: string, scope?: string, reason: string}>} blacklist
+ * @param {string} company - Feed-provided company label.
+ * @param {string} url - Posting URL.
+ * @returns {{company: string, since: string, scope?: string, reason: string}|null}
+ */
+export function findBlacklistEntry(blacklist, company, url) {
+  if (!blacklist || blacklist.size === 0) return null;
+
+  const companyEntry = blacklist.get(normalizeCompany(company || ''));
+  if (companyEntry && companyEntry.scope !== 'domain') return companyEntry;
+
+  let hostname;
+  try {
+    hostname = normalizeBlacklistDomain(new URL(url).hostname);
+  } catch {
+    return null;
+  }
+
+  for (const entry of blacklist.values()) {
+    if (entry.scope !== 'domain') continue;
+    const suffix = normalizeBlacklistDomain(entry.company);
+    if (suffix && (hostname === suffix || hostname.endsWith(`.${suffix}`))) return entry;
+  }
+  return null;
 }
 
 /**
@@ -2790,6 +2946,13 @@ export function registerRunFailureSnapshot(fn) {
   runFailureSnapshot = typeof fn === 'function' ? fn : null;
 }
 
+// NOT locked, deliberately. This runs from the SIGINT handler and the fatal
+// path, which call process.exit() with nothing able to await first, and every
+// lock entry point in pipeline-lock.mjs is async. It is already best-effort and
+// swallows its own errors. So a failure row written while a migration is
+// swapping the file can still be lost; the completed-run path above is the one
+// that is covered. Stated rather than implied, because the alternative is a
+// comment claiming a guarantee this function does not provide.
 export function writeRunFailureRow(status = 'failed', filePath = SCAN_RUNS_PATH) {
   const snapshot = runFailureSnapshot;
   runFailureSnapshot = null;
@@ -2901,6 +3064,13 @@ export function computeConsecutiveFailures(healthRecords) {
     }
   }
   return streaks;
+}
+
+export function emptyTargetStatus(observation) {
+  // A provider outside this HTTP context (local-parser or a keyed plugin)
+  // gives no transport evidence. Preserve its previous empty classification.
+  return observation.requests > 0 && observation.successfulResponses === 0
+    ? 'unverified_zero' : 'empty';
 }
 
 // ── Parallel fetch with concurrency limit ───────────────────────────
@@ -3315,6 +3485,7 @@ async function main() {
   const newOffers = [];
   const errors = [...resolveErrors];
   const emptyTargets = [];
+  const unverifiedZeroTargets = [];
 
   // Arm the failure-path row (#2643) now that the sweep is about to start and
   // every counter it reads is in scope. new_added is hardcoded 0 on a failed
@@ -3344,6 +3515,7 @@ async function main() {
 
   const tasks = targets.map(company => async () => {
     let provider = company._provider;
+    const observation = { requests: 0, successfulResponses: 0, lastStatus: null };
     // includeUndated is deliberately ALWAYS true, independent of the window.
     // It does not mean "include undated postings in the results" — scan.mjs
     // already decides that downstream, where buildPostedDateFilter passes a
@@ -3359,7 +3531,13 @@ async function main() {
     // fix belongs in workday.mjs, where closing it costs the optimisation on
     // every tenant that mixes.
     const ctx = {
-      ...makeHttpCtx(),
+      ...makeHttpCtx({
+        onRequest: () => { observation.requests++; },
+        onResponse: status => {
+          observation.lastStatus = status;
+          if (status >= 200 && status < 300) observation.successfulResponses++;
+        },
+      }),
       sinceMs: earlyStopSinceMs,
       includeUndated: true,
       locationHints: config.location_filter,
@@ -3386,7 +3564,8 @@ async function main() {
       }
       totalFound += jobs.length;
       if (!company._isBoard && jobs.length === 0) {
-        emptyTargets.push(company.name);
+        if (emptyTargetStatus(observation) === 'empty') emptyTargets.push(company.name);
+        else unverifiedZeroTargets.push(company.name);
       }
 
       for (const job of jobs) {
@@ -3401,7 +3580,7 @@ async function main() {
         // silent: skips are counted and reported in the run summary, and
         // --include-blacklisted lets the posting through annotated instead.
         if (blacklist.size > 0) {
-          const blEntry = blacklist.get(normalizeCompany(job.company || company.name || ''));
+          const blEntry = findBlacklistEntry(blacklist, job.company || company.name || '', job.url);
           if (blEntry) {
             if (!includeBlacklisted) {
               totalFilteredBlacklist++;
@@ -3510,6 +3689,7 @@ async function main() {
         company: company.name,
         error: err.message,
         kind: classifyFetchError(err),
+        status: err.status ?? observation.lastStatus,
       });
     }
   });
@@ -3733,9 +3913,11 @@ async function main() {
   );
   for (const t of targets) {
     const isEmpty = emptyTargets.includes(t.name);
+    const isUnverifiedZero = unverifiedZeroTargets.includes(t.name);
 
     let status = errorKindByCompany.get(t.name) || 'reachable';
     if (status === 'reachable' && isEmpty) status = 'empty';
+    if (status === 'reachable' && isUnverifiedZero) status = 'unverified_zero';
 
     healthRecords.push({ timestamp: nowStr, company: t.name, status });
   }
@@ -3751,7 +3933,8 @@ async function main() {
   // included — a WAF that 403s the scanner every run is coverage decay too).
   // Below threshold, only slug_gone/network keep their dedicated warnings;
   // auth/server/unknown stay in the one-off `Errors (N):` print below.
-  for (const e of [...unreachableTargets, ...networkTargets, ...otherErrors.filter((x) => x.kind)]) {
+  for (const e of [...unreachableTargets, ...networkTargets, ...otherErrors.filter((x) => x.kind),
+    ...unverifiedZeroTargets.map(company => ({ company, kind: 'unverified_zero' }))]) {
     const streak = currentStreaks.get(e.company) || 1;
     if (streak >= STREAK_THRESHOLD) {
       if (!persistentlyDead.includes(e.company)) persistentlyDead.push(e.company);
@@ -3773,6 +3956,9 @@ async function main() {
   }
   if (emptyTargets.length > 0) {
     console.log(`🟡 ${emptyTargets.length} target(s) live but empty: ${emptyTargets.join(', ')}`);
+  }
+  if (unverifiedZeroTargets.length > 0) {
+    console.log(`⚠️  ${unverifiedZeroTargets.length} target(s) returned zero jobs without a successful HTTP response: ${unverifiedZeroTargets.join(', ')}`);
   }
   if (newlyDeadNetwork.length > 0) {
     console.log(`\nNetwork errors (${newlyDeadNetwork.length}):`);
@@ -3807,7 +3993,14 @@ async function main() {
   // writes; a --dry-run must leave no trace.
   if (!dryRun) {
     await appendPortalHealth(healthRecords);
-    appendScanRunSummary({
+    // Locked on the same file the migration locks, for the reason the sibling
+    // append at appendToScanHistory already gives: two writers interleaving a
+    // read-modify-write on an append-only TSV silently drop each other's rows.
+    // migrate-scan-runs.mjs rewrites this file wholesale, so without the lock a
+    // run finishing mid-migration is written into a file that is then replaced
+    // by a snapshot taken before it, and the row is gone from the live file and
+    // from the .bak. Measured at ~9ms of exposure, and reproduced.
+    await withPipelineLock(SCAN_RUNS_PATH, () => appendScanRunSummary({
       timestamp: new Date().toISOString(), status: 'completed',
       companies: summaryCompanies, boards: summaryBoards, found: totalFound,
       filteredTitle: totalFilteredTitle, filteredTier: totalFilteredTier,
@@ -3819,7 +4012,7 @@ async function main() {
       filteredVisa: totalFilteredVisa,
       filteredPostedDate: totalFilteredPostedDate,
       filteredCountryEligibility: totalFilteredCountryEligibility,
-    });
+    }));
   }
   // The run completed (or was a dry run) — disarm the failure row.
   registerRunFailureSnapshot(null);
@@ -3843,6 +4036,7 @@ async function main() {
       added: verifiedOffers.length,
       added_urls: verifiedOffers.map(offer => offer.url),
       errors: errors.map(({ company, error }) => ({ company, error })),
+      unverified_zero: unverifiedZeroTargets,
       dry_run: dryRun,
     }, errors.length > 0 ? 2 : 0);
   }
