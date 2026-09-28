@@ -21,7 +21,7 @@ export const NODE_DEFS = [
   { id: "tracked", label: "Tracked", rank: 0, tone: "neutral" },
   { id: "skip", label: "SKIP", rank: 1, tone: "danger" },
   { id: "evaluated", label: "Still evaluated", rank: 1, tone: "muted" },
-  { id: "discardedEarly", label: "Discarded (not applied)", rank: 1, tone: "muted" },
+  { id: "discardedEarly", label: "Discarded (no application recorded)", rank: 1, tone: "muted" },
   { id: "submitted", label: "Submitted", rank: 1, tone: "info" },
   { id: "waiting", label: "Waiting", rank: 2, tone: "warn" },
   { id: "engaged", label: "Company engaged", rank: 2, tone: "info" },
